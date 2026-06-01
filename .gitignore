@@ -1,0 +1,11 @@
+outputs/
+/bin/
+.env
+*.local.json
+firebase-auth.json
+firebase-auth.json.age
+*.token.json
+*.token.json.age
+.devenv/
+.devenv.flake.nix
+/cpt-crawl

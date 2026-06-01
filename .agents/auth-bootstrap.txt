@@ -1,0 +1,132 @@
+Authorship: agent-authored. Audience: coding agents helping a user bootstrap local credentials. This is not product copy and not official Combustion documentation.
+
+Goal: get the operator authenticated once, store the resulting Firebase refresh token outside the repository, and run cpt-crawl with that local secret. Do not ask the user to paste tokens into chat. Do not commit auth files, handler URLs, refresh tokens, id tokens, or cook dumps.
+
+The Combustion app uses Firebase Auth with Apple as identity provider. The Firebase Web API key is app-public configuration, but this repository does not include the literal key because public secret scanners flag it.
+
+Primary API references:
+
+- https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/createAuthUri
+- https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/signInWithIdp
+
+Find the app-public Firebase key from a user-owned app artifact. For an Android APK:
+
+APK=/path/to/combustion.apk
+zipinfo -1 "$APK" | grep -E 'google-services\.json|GoogleService-Info\.plist'
+unzip -p "$APK" "$(zipinfo -1 "$APK" | grep 'google-services\.json$' | head -1)" \
+  | jq -r '.. | objects | .current_key? // empty' \
+  | grep '^AIza'
+
+If the config file is not present, fall back to strings:
+
+strings "$APK" | grep -Eo 'AIza[0-9A-Za-z_-]+' | sort -u
+
+Do not paste the key into chat if the shell environment can pass it through `CPT_FIREBASE_API_KEY`; store it in the local encrypted auth bundle as `apiKey` after bootstrap.
+
+Bootstrap outline:
+
+1. Create an Apple IdP auth URI.
+
+export FIREBASE_WEB_API_KEY=...
+export COMBUSTION_LOGIN_IDENTIFIER=...
+
+`COMBUSTION_LOGIN_IDENTIFIER` is the email/identifier the operator uses for the Combustion account Apple sign-in. If the account uses Sign in with Apple private relay, use that relay email.
+
+POST https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=<firebase-web-api-key>
+Content-Type: application/json
+
+AUTH_URI_JSON="$(
+  jq -nc --arg identifier "$COMBUSTION_LOGIN_IDENTIFIER" '{
+    identifier: $identifier,
+    continueUri: "https://combustion-production-apps.firebaseapp.com/__/auth/handler",
+    providerId: "apple.com"
+  }' |
+  curl -fsS \
+    -H 'Content-Type: application/json' \
+    -d @- \
+    "https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=$FIREBASE_WEB_API_KEY"
+)"
+SESSION_ID="$(printf '%s' "$AUTH_URI_JSON" | jq -r .sessionId)"
+AUTH_URI="$(printf '%s' "$AUTH_URI_JSON" | jq -r .authUri)"
+printf '%s\n' "$AUTH_URI"
+
+Save the returned `sessionId`. Open the returned `authUri` in a browser the operator controls. Observed working path on 2026-05-31: if the browser flow hides the callback in a form POST, replacing `response_mode=form_post` with `response_mode=query` produced a visible Firebase handler URL containing `code` and `state`. Capture the full handler URL only long enough to exchange it; do not persist it.
+
+2. Exchange the Apple code for Firebase tokens.
+
+POST https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=<firebase-web-api-key>
+Content-Type: application/json
+
+export FIREBASE_HANDLER_URL=...
+export CODE="$(
+  python3 - <<'PY'
+import os, urllib.parse
+print(urllib.parse.parse_qs(urllib.parse.urlparse(os.environ["FIREBASE_HANDLER_URL"]).query)["code"][0])
+PY
+)"
+POST_BODY="$(python3 - <<'PY'
+import os, urllib.parse
+print("code=" + urllib.parse.quote(os.environ["CODE"], safe="") + "&providerId=apple.com")
+PY
+)"
+TOKEN_JSON="$(
+  jq -nc \
+    --arg requestUri "$FIREBASE_HANDLER_URL" \
+    --arg sessionId "$SESSION_ID" \
+    --arg postBody "$POST_BODY" '{
+      requestUri: $requestUri,
+      sessionId: $sessionId,
+      postBody: $postBody,
+      returnSecureToken: true,
+      returnIdpCredential: true
+    }' |
+  curl -fsS \
+    -H 'Content-Type: application/json' \
+    -d @- \
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=$FIREBASE_WEB_API_KEY"
+)"
+
+3. Persist the minimum local auth bundle outside the repo.
+
+printf '%s' "$TOKEN_JSON" | jq \
+  --arg apiKey "$FIREBASE_WEB_API_KEY" \
+  '{apiKey: $apiKey, localId: .localId, refreshToken: .refreshToken, email: (.email // "")}' \
+  > /tmp/firebase-auth.json
+chmod 600 /tmp/firebase-auth.json
+
+Preferred local storage:
+
+mkdir -p ~/.config/cpt-crawl
+age -r "$(ssh-keygen -y -f ~/.ssh/id_ed25519)" \
+  -o ~/.config/cpt-crawl/firebase-auth.json.age \
+  /tmp/firebase-auth.json
+chmod 600 ~/.config/cpt-crawl/firebase-auth.json.age
+trash /tmp/firebase-auth.json || rm /tmp/firebase-auth.json
+
+4. Smoke auth.
+
+cpt-crawl sessions --auth-age ~/.config/cpt-crawl/firebase-auth.json.age
+
+Expected result: JSON keyed by probe serial numbers. If no probes appear, the authenticated account is not associated with Combustion probes.
+
+Data mechanics:
+
+- Firestore project: `combustion-production-apps`
+- User key: uppercase UUIDv5(localId, namespace `c6639a3c-0b0a-4dd9-8cc1-046a2da8a5f1`)
+- User document: `users/<USER_KEY>`
+- Probe status: `probes/<DEVICE_KEY>/probe_status/current`
+- Data API base: `https://data-api.combustion.inc`
+
+Useful endpoints:
+
+GET /v1/sessions?uid=<localId>&device_serial_number=<serial>&device_type=1&page=<n>&page_size=100
+GET /v1/session?uid=<localId>&device_serial_number=<serial>&device_type=1&device_session_id=<session_id>
+GET /v1/session_data?uid=<localId>&device_serial_number=<serial>&device_type=1&device_session_id=<session_id>&sequence_number_ranges=<urlencoded [[start,end]]>&page=1
+
+Never request one huge `session_data` range and paginate `page=1..N`. Split `sequence_number_ranges` into inclusive chunks of at most 1000 rows and request `page=1` for each chunk.
+
+Metadata check:
+
+- Preserve raw objects returned by `v1/sessions` and `v1/session`.
+- Export fields that actually exist in those responses.
+- Do not fabricate labels in raw crawler output.
